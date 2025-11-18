@@ -136,5 +136,3 @@ project/
 Team: Paach Chawani
 
 ---
-
-If you want, I can also export this `README.md` as a downloadable file or add a short usage GIF.
