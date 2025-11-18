@@ -1,0 +1,22 @@
+{
+  "discovered_ode": "x_ddot = a*x + b*x_dot",
+  "coefficients": {
+    "a": -37.51185607910156,
+    "b": -0.113869808614254,
+    "intercept": 3.4245269298553467
+  },
+  "estimated_parameters": {
+    "omega": 6.12469232526023,
+    "zeta": 0.009295961541171443
+  },
+  "true_parameters": {
+    "omega_true": 6.283185307179586,
+    "zeta_true": 0.1
+  },
+  "errors": {
+    "rms": 16.833972863074948,
+    "nrmse": 0.15906548552348326,
+    "omega_rel_error": 0.025224941517839956,
+    "zeta_rel_error": 0.9070403845882855
+  }
+}
