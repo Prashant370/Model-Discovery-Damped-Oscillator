@@ -1,4 +1,5 @@
-# pinned_per_traj_fixed.py
+# Lord BHolu
+#  pinned_per_traj_fixed.py
 # Fix: train one PINN per trajectory (float64), collect derivatives, then Lasso->weighted OLS debias.
 import json, math
 from pathlib import Path
