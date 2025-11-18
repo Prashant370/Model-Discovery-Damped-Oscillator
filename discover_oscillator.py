@@ -1,6 +1,7 @@
-# Lord BHolu
-#  pinned_per_traj_fixed.py
-# Fix: train one PINN per trajectory (float64), collect derivatives, then Lasso->weighted OLS debias.
+# pinned_per_traj_with_output.py
+# Train one PINN per trajectory (float64), collect derivatives, then ElasticNet/Lasso -> weighted OLS debias.
+# Saves results to dataset/output.json (same structure as original pipeline).
+
 import json, math
 from pathlib import Path
 import numpy as np
@@ -70,12 +71,10 @@ class SmallMLP(nn.Module):
         return self.net(t)
 
 def train_model_on_traj(t_np, x_np, epochs=8000, lr=1e-3, batch_size=128, use_dx_supervision=False, dx_weight=1.0):
-    # t_np shape (n,1), x_np shape (n,1)
     model = SmallMLP(hidden=128).to(device).to(dtype=DTYPE)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-8)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[int(epochs*0.5), int(epochs*0.8)], gamma=0.1)
     loss_fn = nn.MSELoss()
-    # precompute dx_fd if supervision requested
     if use_dx_supervision:
         dx_fd = np.zeros_like(x_np).ravel()
         dx_fd[1:-1] = (x_np[2:,0] - x_np[:-2,0]) / (2*dt)
@@ -83,15 +82,12 @@ def train_model_on_traj(t_np, x_np, epochs=8000, lr=1e-3, batch_size=128, use_dx
         dx_fd[-1] = (x_np[-1,0] - x_np[-2,0]) / dt
         dx_fd = dx_fd.reshape(-1,1).astype(np.float64)
         dx_fd_t = torch.from_numpy(dx_fd).to(device).to(dtype=DTYPE)
-    # create tensors
     t_t = torch.from_numpy(t_np.astype(np.float64)).to(device).to(dtype=DTYPE)
     x_t = torch.from_numpy(x_np.astype(np.float64)).to(device).to(dtype=DTYPE)
     n = t_np.shape[0]
-    # use manual batching without shuffle (data is smooth)
     indices = np.arange(n)
     for ep in range(epochs):
-        # small-batch training loop
-        perm = indices  # no shuffle to keep derivative target alignment if supervised
+        perm = indices
         epoch_loss = 0.0
         for i in range(0, n, batch_size):
             batch_idx = perm[i:i+batch_size]
@@ -101,7 +97,6 @@ def train_model_on_traj(t_np, x_np, epochs=8000, lr=1e-3, batch_size=128, use_dx
             pred = model(bt)
             loss_x = loss_fn(pred, bx)
             if use_dx_supervision:
-                # autograd derivative wrt time
                 grads = torch.autograd.grad(pred, bt, grad_outputs=torch.ones_like(pred), create_graph=True, retain_graph=True)[0]
                 dx_pred = grads[:,0:1]
                 loss_dx = loss_fn(dx_pred, dx_fd_t[batch_idx])
@@ -112,7 +107,6 @@ def train_model_on_traj(t_np, x_np, epochs=8000, lr=1e-3, batch_size=128, use_dx
             opt.step()
             epoch_loss += float(loss.detach().cpu().numpy()) * bt.shape[0]
         scheduler.step()
-        # optional logging
         if (ep+1) % 1000 == 0 or ep == 0:
             print(f"traj ep {ep+1}/{epochs} avg loss {epoch_loss/n:.3e}")
     return model
@@ -129,11 +123,9 @@ for tid, p in inits.items():
     t_np = t_grid.reshape(-1,1).astype(np.float64)
     x_np = (np.exp(-zeta_true * omega_true * t_grid) * (A * np.cos(omega_d_true * t_grid) + B * np.sin(omega_d_true * t_grid))).reshape(-1,1).astype(np.float64)
 
-    # train per-traj model (longer epochs, lower lr)
     print(f"\nTraining trajectory {tid} model...")
     model = train_model_on_traj(t_np, x_np, epochs=8000, lr=1e-3, batch_size=128, use_dx_supervision=False)
 
-    # evaluate derivatives via autograd on full grid
     t_t = torch.from_numpy(t_np).to(device).to(dtype=DTYPE).requires_grad_(True)
     with torch.set_grad_enabled(True):
         x_pred_t = model(t_t)
@@ -145,7 +137,6 @@ for tid, p in inits.items():
     dx_dt_all.append(dx_dt_t.detach().cpu().numpy().ravel())
     d2x_dt2_all.append(d2x_dt2_t.detach().cpu().numpy().ravel())
 
-# stack
 x_pred_np = np.concatenate(x_pred_all)
 dx_dt_np = np.concatenate(dx_dt_all)
 d2x_dt2_np = np.concatenate(d2x_dt2_all)
@@ -163,7 +154,6 @@ if keep_mask.sum() < 200:
 Theta_use = Theta[keep_mask]
 y_use = y[keep_mask]
 
-# normalize Theta for Lasso stability
 col_means = Theta_use.mean(axis=0)
 col_scales = Theta_use.std(axis=0)
 col_scales[col_scales==0] = 1.0
@@ -185,21 +175,17 @@ except Exception as e:
     intercept_norm = lasso.intercept_
     method_used = "LassoCV"
 
-# Unscale coefficients to original Theta scale
 coef_unscaled = coef_norm / col_scales
 intercept_unscaled = float(intercept_norm - np.sum(col_means * coef_unscaled))
 
-# Selection mask
 sel_mask = np.abs(coef_norm) > 1e-8
 print(f"Selection mask (features used): {sel_mask} (feature order [x, xdot])")
 
 # -------------------------
 # Debias with weighted OLS (weight by |x| amplitude)
 # -------------------------
-# weights proportional to amplitude (more informative points get higher weight)
 weights = np.abs(Theta_use[:,0]) + 1e-6
 if sel_mask.sum() == 0:
-    # no features selected (unlikely); fallback to OLS on both
     sel_mask = np.array([True, True])
 
 lr = LinearRegression()
@@ -237,7 +223,6 @@ x_est_all = []
 for tid,p in inits.items():
     A,B = p["A"], p["B"]
     x_true = np.exp(-zeta_true * omega_true * t_grid) * (A*np.cos(omega_d_true*t_grid) + B*np.sin(omega_d_true*t_grid))
-    # analytic initial conditions
     x0 = A
     dx0 = -zeta_true * omega_true * A + omega_d_true * B
     sol = solve_ivp(rhs, (t_grid[0], t_grid[-1]), [x0, dx0], t_eval=t_grid, rtol=1e-9, atol=1e-12)
@@ -254,3 +239,26 @@ zeta_err_rel = abs(zeta_est - zeta_true) / abs(zeta_true)
 
 print(f"\nRMS = {rms:.6g}, NRMSE = {nrmse:.6g}")
 print(f"Relative errors -> omega: {omega_err_rel:.6g}, zeta: {zeta_err_rel:.6g}")
+
+# -------------------------
+# Save results to output.json (same structure as original)
+# -------------------------
+out = {
+    "discovered_ode": "x_ddot = a*x + b*x_dot",
+    "coefficients": {"a": a_est, "b": b_est, "intercept": intercept_debiased},
+    "estimated_parameters": {"omega": omega_est, "zeta": zeta_est},
+    "true_parameters": {"omega_true": float(omega_true), "zeta_true": float(zeta_true)},
+    "errors": {
+        "rms": rms,
+        "nrmse": nrmse,
+        "omega_rel_error": omega_err_rel,
+        "zeta_rel_error": zeta_err_rel
+    },
+    "method": method_used
+}
+
+output_json = out_dir / "output.json"
+with open(output_json, "w") as f:
+    json.dump(out, f, indent=2)
+
+print(f"Saved results to {output_json}")
