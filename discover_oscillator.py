@@ -1,39 +1,31 @@
-# Author: Team - paach chawani 
-
-"""
-Full pipeline:
-- dataset generation (5 traj x 500 pts)
-- save data.csv, metadata.json
-- PINN training (t -> x_pred)
-- derivatives via autograd
-- sparse regression (LassoCV) to discover x_ddot = a*x + b*x_dot
-- convert to omega, zeta
-- simulate discovered ODE for each traj and compute RMS, NRMSE
-- save output.json
-"""
-
-import json
+# pinned_per_traj_fixed.py
+# Fix: train one PINN per trajectory (float64), collect derivatives, then Lasso->weighted OLS debias.
+import json, math
 from pathlib import Path
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-from sklearn.linear_model import LassoCV
+import torch, torch.nn as nn
+from sklearn.linear_model import LassoCV, LinearRegression, ElasticNetCV
 from scipy.integrate import solve_ivp
-import math
+import warnings
+warnings.filterwarnings("ignore")
 
 # -------------------------
-# 1) dataset generation
+# Settings
 # -------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.set_default_dtype(torch.float64)   # double precision
+DTYPE = torch.float64
+
 out_dir = Path("dataset")
 out_dir.mkdir(exist_ok=True)
 
-# true system (hidden from model)
+# true system
 zeta_true = 0.1
-omega_true = 2 * np.pi
-omega_d_true = omega_true * np.sqrt(max(0.0, 1 - zeta_true ** 2))
+omega_true = 2 * math.pi
+omega_d_true = omega_true * math.sqrt(max(0.0, 1 - zeta_true**2))
 
-# initial conditions for 5 trajectories (A,B)
+# trajectories
 inits = {
     1: {"A": 25.0, "B": 64.0},
     2: {"A": 12.0, "B": -5.0},
@@ -46,224 +38,218 @@ n_traj = len(inits)
 n_points = 500
 t0, t1 = 0.0, 10.0
 t_grid = np.linspace(t0, t1, n_points)
+dt = t_grid[1] - t_grid[0]
 
+# generate dataset (no noise)
 rows = []
-noise_std = 0.0  # set >0.0 to add measurement noise
 for tid, p in inits.items():
     A, B = p["A"], p["B"]
     x = np.exp(-zeta_true * omega_true * t_grid) * (A * np.cos(omega_d_true * t_grid) + B * np.sin(omega_d_true * t_grid))
-    if noise_std > 0:
-        x = x + np.random.normal(0, noise_std, size=x.shape)
     for ti, xi in zip(t_grid, x):
-        rows.append({"traj_id": int(tid), "t": float(ti), "x": float(xi)})
-
+        rows.append({"traj_id": int(tid), "t": float(ti), "x": float(xi), "A": float(A), "B": float(B)})
 df = pd.DataFrame(rows)
-data_csv = out_dir / "data.csv"
-df.to_csv(data_csv, index=False)
-
-meta = {"system": {"zeta": float(zeta_true), "omega": float(omega_true)}, "trajectories": inits}
-meta_json = out_dir / "metadata.json"
-with open(meta_json, "w") as f:
-    json.dump(meta, f, indent=2)
-
-print(f"Saved dataset: {data_csv} and metadata: {meta_json}")
+df.to_csv(out_dir / "data.csv", index=False)
+with open(out_dir / "metadata.json", "w") as f:
+    json.dump({"system":{"zeta":zeta_true,"omega":omega_true}, "trajectories": inits}, f, indent=2)
 
 # -------------------------
-# 2) PINN: simple MLP fit
+# Per-trajectory model definition
 # -------------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.manual_seed(0)
-np.random.seed(0)
-
-# prepare training data (all trajectories combined)
-T = df["t"].values.astype(np.float32)[:, None]
-X = df["x"].values.astype(np.float32)[:, None]
-
-t_tensor = torch.from_numpy(T).to(device)
-x_tensor = torch.from_numpy(X).to(device)
-
-# define MLP
-class MLP(nn.Module):
-    def __init__(self, layers=[1, 64, 64, 64, 1], act=nn.Tanh):
+class SmallMLP(nn.Module):
+    def __init__(self, hidden=128):
         super().__init__()
-        seq = []
-        for i in range(len(layers)-1):
-            seq.append(nn.Linear(layers[i], layers[i+1]))
-            if i < len(layers)-2:
-                seq.append(act())
-        self.net = nn.Sequential(*seq)
+        self.net = nn.Sequential(
+            nn.Linear(1, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1)
+        )
     def forward(self, t):
         return self.net(t)
 
-model = MLP().to(device)
-opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-loss_fn = nn.MSELoss()
-
-# training (fit x(t) only)
-n_epochs = 3000
-batch_size = 1024
-dataset = torch.utils.data.TensorDataset(t_tensor, x_tensor)
-loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
-
-print("Training PINN to fit x(t)...")
-for ep in range(n_epochs):
-    running = 0.0
-    for bt, bx in loader:
-        opt.zero_grad()
-        pred = model(bt)
-        loss = loss_fn(pred, bx)
-        loss.backward()
-        opt.step()
-        running += loss.item() * bt.shape[0]
-    if (ep+1) % 500 == 0 or ep == 0:
-        print(f"epoch {ep+1}/{n_epochs} loss {running/len(dataset):.4e}")
-print("PINN training finished.")
+def train_model_on_traj(t_np, x_np, epochs=8000, lr=1e-3, batch_size=128, use_dx_supervision=False, dx_weight=1.0):
+    # t_np shape (n,1), x_np shape (n,1)
+    model = SmallMLP(hidden=128).to(device).to(dtype=DTYPE)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-8)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[int(epochs*0.5), int(epochs*0.8)], gamma=0.1)
+    loss_fn = nn.MSELoss()
+    # precompute dx_fd if supervision requested
+    if use_dx_supervision:
+        dx_fd = np.zeros_like(x_np).ravel()
+        dx_fd[1:-1] = (x_np[2:,0] - x_np[:-2,0]) / (2*dt)
+        dx_fd[0] = (x_np[1,0] - x_np[0,0]) / dt
+        dx_fd[-1] = (x_np[-1,0] - x_np[-2,0]) / dt
+        dx_fd = dx_fd.reshape(-1,1).astype(np.float64)
+        dx_fd_t = torch.from_numpy(dx_fd).to(device).to(dtype=DTYPE)
+    # create tensors
+    t_t = torch.from_numpy(t_np.astype(np.float64)).to(device).to(dtype=DTYPE)
+    x_t = torch.from_numpy(x_np.astype(np.float64)).to(device).to(dtype=DTYPE)
+    n = t_np.shape[0]
+    # use manual batching without shuffle (data is smooth)
+    indices = np.arange(n)
+    for ep in range(epochs):
+        # small-batch training loop
+        perm = indices  # no shuffle to keep derivative target alignment if supervised
+        epoch_loss = 0.0
+        for i in range(0, n, batch_size):
+            batch_idx = perm[i:i+batch_size]
+            bt = t_t[batch_idx].clone().detach().requires_grad_(True)
+            bx = x_t[batch_idx]
+            opt.zero_grad()
+            pred = model(bt)
+            loss_x = loss_fn(pred, bx)
+            if use_dx_supervision:
+                # autograd derivative wrt time
+                grads = torch.autograd.grad(pred, bt, grad_outputs=torch.ones_like(pred), create_graph=True, retain_graph=True)[0]
+                dx_pred = grads[:,0:1]
+                loss_dx = loss_fn(dx_pred, dx_fd_t[batch_idx])
+                loss = loss_x + dx_weight * loss_dx
+            else:
+                loss = loss_x
+            loss.backward()
+            opt.step()
+            epoch_loss += float(loss.detach().cpu().numpy()) * bt.shape[0]
+        scheduler.step()
+        # optional logging
+        if (ep+1) % 1000 == 0 or ep == 0:
+            print(f"traj ep {ep+1}/{epochs} avg loss {epoch_loss/n:.3e}")
+    return model
 
 # -------------------------
-# 3) evaluate PINN and compute derivatives
+# Train models per trajectory and collect derivatives
 # -------------------------
-# We'll evaluate on a sufficiently dense grid combining all original t points per trajectory.
-# Use unique t_grid (same used in generation) to compute derivative fields per trajectory.
-t_eval = np.unique(df["t"].values).astype(np.float32)
-t_eval_tensor = torch.from_numpy(t_eval.reshape(-1,1)).to(device)
-t_eval_tensor.requires_grad_(True)
+x_pred_all = []
+dx_dt_all = []
+d2x_dt2_all = []
 
-with torch.set_grad_enabled(True):
-    x_pred = model(t_eval_tensor)                         # (N,1)
-    dx_dt = torch.autograd.grad(x_pred, t_eval_tensor, grad_outputs=torch.ones_like(x_pred), create_graph=True)[0]
-    d2x_dt2 = torch.autograd.grad(dx_dt, t_eval_tensor, grad_outputs=torch.ones_like(dx_dt), create_graph=True)[0]
+for tid, p in inits.items():
+    A, B = p["A"], p["B"]
+    t_np = t_grid.reshape(-1,1).astype(np.float64)
+    x_np = (np.exp(-zeta_true * omega_true * t_grid) * (A * np.cos(omega_d_true * t_grid) + B * np.sin(omega_d_true * t_grid))).reshape(-1,1).astype(np.float64)
 
-x_pred_np = x_pred.detach().cpu().numpy().ravel()
-dx_dt_np = dx_dt.detach().cpu().numpy().ravel()
-d2x_dt2_np = d2x_dt2.detach().cpu().numpy().ravel()
+    # train per-traj model (longer epochs, lower lr)
+    print(f"\nTraining trajectory {tid} model...")
+    model = train_model_on_traj(t_np, x_np, epochs=8000, lr=1e-3, batch_size=128, use_dx_supervision=False)
 
-# map these back to full dataset rows (matching t values)
-# For regression it's fine to use the dense unique t_eval points
-# Build Theta = [x, x_dot] and target y = x_ddot
+    # evaluate derivatives via autograd on full grid
+    t_t = torch.from_numpy(t_np).to(device).to(dtype=DTYPE).requires_grad_(True)
+    with torch.set_grad_enabled(True):
+        x_pred_t = model(t_t)
+        grads = torch.autograd.grad(x_pred_t, t_t, grad_outputs=torch.ones_like(x_pred_t), create_graph=True)[0]
+        dx_dt_t = grads[:,0:1]
+        d2_all = torch.autograd.grad(dx_dt_t, t_t, grad_outputs=torch.ones_like(dx_dt_t), create_graph=True)[0]
+        d2x_dt2_t = d2_all[:,0:1]
+    x_pred_all.append(x_pred_t.detach().cpu().numpy().ravel())
+    dx_dt_all.append(dx_dt_t.detach().cpu().numpy().ravel())
+    d2x_dt2_all.append(d2x_dt2_t.detach().cpu().numpy().ravel())
+
+# stack
+x_pred_np = np.concatenate(x_pred_all)
+dx_dt_np = np.concatenate(dx_dt_all)
+d2x_dt2_np = np.concatenate(d2x_dt2_all)
+
+# -------------------------
+# Build regression library and filter low amplitude points
+# -------------------------
 Theta = np.vstack([x_pred_np, dx_dt_np]).T
 y = d2x_dt2_np
 
-# optionally filter near-zero amplitude times to avoid ill-conditioning
 amp = np.abs(x_pred_np)
-keep_mask = amp > 1e-6  # discard points where x ~ 0 (optional)
-if keep_mask.sum() < 50:
-    keep_mask = np.ones_like(amp, dtype=bool)
-
+keep_mask = amp > 1e-6
+if keep_mask.sum() < 200:
+    keep_mask = amp > 1e-9
 Theta_use = Theta[keep_mask]
 y_use = y[keep_mask]
 
-# normalize Theta columns for numerical stability
+# normalize Theta for Lasso stability
 col_means = Theta_use.mean(axis=0)
 col_scales = Theta_use.std(axis=0)
-col_scales[col_scales == 0] = 1.0
+col_scales[col_scales==0] = 1.0
 Theta_norm = (Theta_use - col_means) / col_scales
 
 # -------------------------
-# 4) sparse regression (LassoCV)
+# Sparse regression: try ElasticNetCV first (less shrinkage), fallback to LassoCV
 # -------------------------
-print("Running LassoCV sparse regression...")
-lasso = LassoCV(cv=5, n_alphas=50, max_iter=20000).fit(Theta_norm, y_use)
-coef_norm = lasso.coef_  # coefficients for normalized Theta
-intercept = lasso.intercept_
+print("\nRunning ElasticNetCV for selection (less shrinkage than Lasso)...")
+try:
+    enet = ElasticNetCV(l1_ratio=[0.1,0.5,0.9], cv=5, n_alphas=60, max_iter=20000).fit(Theta_norm, y_use)
+    coef_norm = enet.coef_
+    intercept_norm = enet.intercept_
+    method_used = "ElasticNetCV"
+except Exception as e:
+    print("ElasticNet failed, falling back to LassoCV:", e)
+    lasso = LassoCV(cv=5, n_alphas=80, max_iter=20000).fit(Theta_norm, y_use)
+    coef_norm = lasso.coef_
+    intercept_norm = lasso.intercept_
+    method_used = "LassoCV"
 
-# un-normalize coefficients: y = (Theta - mean)/scale * coef_norm + intercept
-# So original coef = coef_norm/scale, and addition: intercept_adjust = intercept - sum(mean/scale * coef_norm)
-coef = coef_norm / col_scales
-intercept_adjust = intercept - np.sum(col_means * coef)
+# Unscale coefficients to original Theta scale
+coef_unscaled = coef_norm / col_scales
+intercept_unscaled = float(intercept_norm - np.sum(col_means * coef_unscaled))
 
-a_est = float(coef[0])   # coefficient on x
-b_est = float(coef[1])   # coefficient on x_dot
-
-print(f"discovered coefficients: a = {a_est:.6g}, b = {b_est:.6g}, intercept = {float(intercept_adjust):.6g}")
+# Selection mask
+sel_mask = np.abs(coef_norm) > 1e-8
+print(f"Selection mask (features used): {sel_mask} (feature order [x, xdot])")
 
 # -------------------------
-# 5) convert to zeta, omega
+# Debias with weighted OLS (weight by |x| amplitude)
 # -------------------------
-# a = -omega^2, b = -2 zeta omega
+# weights proportional to amplitude (more informative points get higher weight)
+weights = np.abs(Theta_use[:,0]) + 1e-6
+if sel_mask.sum() == 0:
+    # no features selected (unlikely); fallback to OLS on both
+    sel_mask = np.array([True, True])
+
+lr = LinearRegression()
+lr.fit(Theta_use[:, sel_mask], y_use, sample_weight=weights)
+coef_debiased = np.zeros(Theta_use.shape[1])
+coef_debiased[sel_mask] = lr.coef_
+intercept_debiased = float(lr.intercept_)
+
+a_est = float(coef_debiased[0])
+b_est = float(coef_debiased[1])
+print(f"\nMethod: {method_used} selection + weighted OLS debias")
+print(f"Debiased coefficients: a = {a_est:.6g}, b = {b_est:.6g}, intercept = {intercept_debiased:.6g}")
+
+# -------------------------
+# Convert to omega, zeta
+# -------------------------
 if a_est >= 0:
-    omega_est = float('nan')
-    zeta_est = float('nan')
-    print("Warning: a_est >= 0, cannot compute omega = sqrt(-a).")
+    omega_est = float('nan'); zeta_est = float('nan')
+    print("a_est >= 0, cannot compute omega")
 else:
     omega_est = math.sqrt(-a_est)
     zeta_est = -b_est / (2.0 * omega_est)
 
-print(f"estimated omega = {omega_est:.6g}, estimated zeta = {zeta_est:.6g}")
+print(f"\nEstimated omega = {omega_est:.10g} (true {omega_true:.10g})")
+print(f"Estimated zeta  = {zeta_est:.10g} (true {zeta_true:.10g})")
 
 # -------------------------
-# 6) simulate discovered ODE and compute errors
+# Simulate discovered ODE and compute RMS / nRMSE
 # -------------------------
-# ODE form: x_ddot = a_est * x + b_est * x_dot
 def rhs(t, y):
-    # y = [x, x_dot]
-    return [y[1], a_est * y[0] + b_est * y[1]]
+    return [y[1], a_est*y[0] + b_est*y[1]]
 
-# For comparison we simulate each trajectory on the original t_grid and compute errors.
 x_true_all = []
 x_est_all = []
-t_all = []
-
-for tid, p in inits.items():
-    A, B = p["A"], p["B"]
-    # initial conditions from analytic solution at t=0:
+for tid,p in inits.items():
+    A,B = p["A"], p["B"]
+    x_true = np.exp(-zeta_true * omega_true * t_grid) * (A*np.cos(omega_d_true*t_grid) + B*np.sin(omega_d_true*t_grid))
+    # analytic initial conditions
     x0 = A
-    dx0 = B * omega_d_true  # careful: if using representation x = e^{-zeta w t}(A cos + B sin) then at t=0:
-    # derivative at t=0 is: dx/dt|0 = -zeta*omega*A + omega_d*( -A*0? ) Wait simpler: compute from analytic formula explicitly:
-    # compute analytic derivative at t=0 for consistency
-    def analytic_x_and_dx_at0(A, B):
-        # x(t) = e^{-zeta w t} (A cos(wd t) + B sin(wd t))
-        # dx/dt = e^{-z w t} [ -z w (A cos + B sin) + (-A wd sin + B wd cos) ]
-        x0 = A
-        dx0 = -zeta_true * omega_true * A + omega_d_true * B
-        return x0, dx0
-    x0, dx0 = analytic_x_and_dx_at0(A, B)
-
-    # simulate discovered ODE on the same time grid
-    sol = solve_ivp(rhs, (t_grid[0], t_grid[-1]), [x0, dx0], t_eval=t_grid, rtol=1e-8, atol=1e-10, method='RK45')
+    dx0 = -zeta_true * omega_true * A + omega_d_true * B
+    sol = solve_ivp(rhs, (t_grid[0], t_grid[-1]), [x0, dx0], t_eval=t_grid, rtol=1e-9, atol=1e-12)
     x_est = sol.y[0]
-    # compute true (noise-free) analytic x(t) for this A,B
-    x_true = np.exp(-zeta_true * omega_true * t_grid) * (A * np.cos(omega_d_true * t_grid) + B * np.sin(omega_d_true * t_grid))
     x_true_all.append(x_true)
     x_est_all.append(x_est)
-    t_all.append(t_grid)
-
-# flatten
-x_true_all = np.concatenate(x_true_all)
-x_est_all = np.concatenate(x_est_all)
-t_all = np.concatenate(t_all)
-
-# compute RMS and NRMSE
+x_true_all = np.concatenate(x_true_all); x_est_all = np.concatenate(x_est_all)
 diff = x_est_all - x_true_all
 rms = float(np.sqrt(np.mean(diff**2)))
 x_range = float(x_true_all.max() - x_true_all.min())
-nrmse = float(rms / x_range) if x_range != 0 else float('nan')
+nrmse = rms / x_range
+omega_err_rel = abs(omega_est - omega_true) / abs(omega_true)
+zeta_err_rel = abs(zeta_est - zeta_true) / abs(zeta_true)
 
-# parameter relative errors
-omega_err_rel = abs(omega_est - omega_true) / abs(omega_true) if not math.isnan(omega_est) else float('nan')
-zeta_err_rel = abs(zeta_est - zeta_true) / abs(zeta_true) if not math.isnan(zeta_est) else float('nan')
-
-# -------------------------
-# 7) save output.json
-# -------------------------
-out = {
-    "discovered_ode": "x_ddot = a*x + b*x_dot",
-    "coefficients": {"a": a_est, "b": b_est, "intercept": float(intercept_adjust)},
-    "estimated_parameters": {"omega": omega_est, "zeta": zeta_est},
-    "true_parameters": {"omega_true": float(omega_true), "zeta_true": float(zeta_true)},
-    "errors": {
-        "rms": rms,
-        "nrmse": nrmse,
-        "omega_rel_error": omega_err_rel,
-        "zeta_rel_error": zeta_err_rel
-    }
-}
-
-output_json = out_dir / "output.json"
-with open(output_json, "w") as f:
-    json.dump(out, f, indent=2)
-
-print(f"Saved results to {output_json}")
-print("Summary:")
-print(f"  a = {a_est:.6g}, b = {b_est:.6g}")
-print(f"  omega_est = {omega_est:.6g} (true {omega_true:.6g}), zeta_est = {zeta_est:.6g} (true {zeta_true:.6g})")
-print(f"  RMS = {rms:.6g}, NRMSE = {nrmse:.6g}")
+print(f"\nRMS = {rms:.6g}, NRMSE = {nrmse:.6g}")
+print(f"Relative errors -> omega: {omega_err_rel:.6g}, zeta: {zeta_err_rel:.6g}")
